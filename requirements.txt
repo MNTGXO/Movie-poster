@@ -2,3 +2,5 @@ pyrofork
 tgcrypto
 motor
 aiohttp
+tmdbv3api
+python-dotenv
