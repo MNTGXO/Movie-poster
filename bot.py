@@ -211,7 +211,11 @@ async def resolve_chat(c: Client, m, text: str | None = None):
 @app.on_message(filters.command(["start", "help"]) & filters.private)
 async def start(_, m):
     if m.from_user.id not in ADMINS:
-        return await m.reply("👋 Movie bot.")
+        return await m.reply(
+            "👋 Movie bot.\n\n"
+            f"Your ID: <code>{m.from_user.id}</code>\n"
+            "If you are the owner, add this ID to the <code>ADMINS</code> environment variable and redeploy."
+        )
     await m.reply(
         "<b>Admin commands</b>\n"
         "/link <code>Bandra 2026</code> [quality] – link a movie to a channel\n"
@@ -221,6 +225,23 @@ async def start(_, m):
         "/movies – list linked movies\n"
         "/delmovie <code>tmdb_id</code> – unlink a movie\n\n"
         "Send files to this chat or post them in a source channel – the bot routes them automatically."
+    )
+
+
+@app.on_message(filters.command("id"))
+async def my_id(_, m):
+    await m.reply(f"Your ID: <code>{m.from_user.id}</code>\nChat ID: <code>{m.chat.id}</code>")
+
+
+ADMIN_CMDS = ["link", "addsource", "delsource", "sources", "movies", "delmovie"]
+
+
+@app.on_message(filters.command(ADMIN_CMDS) & ~admin)
+async def not_admin(_, m):
+    await m.reply(
+        "⛔ You are not an admin of this bot.\n"
+        f"Your ID: <code>{m.from_user.id}</code>\n"
+        "Add it to the <code>ADMINS</code> environment variable and redeploy."
     )
 
 
@@ -501,6 +522,10 @@ async def main():
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
 
+    if not ADMINS:
+        log.warning("ADMINS is empty – set ADMINS=your_telegram_id or no command will work!")
+    else:
+        log.info("Admins: %s", ADMINS)
     await app.start()
     log.info("Bot started as @%s", (await app.get_me()).username)
     await idle()
