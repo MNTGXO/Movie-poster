@@ -1,4 +1,4 @@
-### File: `README.md` ```markdown
+
 # Movie Poster Bot
 
 A Telegram bot that automatically posts movie posters and metadata from TMDB when files are shared in source channels.
