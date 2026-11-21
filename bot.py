@@ -211,11 +211,10 @@ async def resolve_chat(c: Client, m, text: str | None = None):
 @app.on_message(filters.command(["start", "help"]) & filters.private)
 async def start(_, m):
     if m.from_user.id not in ADMINS:
-        return await m.reply(
-            "👋 Movie bot.\n\n"
-            f"Your ID: <code>{m.from_user.id}</code>\n"
-            "If you are the owner, add this ID to the <code>ADMINS</code> environment variable and redeploy."
-        )
+        log.info("ignored /start from non-admin %s", m.from_user.id)
+        if not ADMINS:  # bootstrap: nobody configured yet, so show the ID to whoever is setting up
+            await m.reply(f"Your ID: <code>{m.from_user.id}</code>\nSet it as <code>ADMINS</code> and redeploy.")
+        return
     await m.reply(
         "<b>Admin commands</b>\n"
         "/link <code>Bandra 2026</code> [quality] – link a movie to a channel\n"
@@ -230,7 +229,8 @@ async def start(_, m):
 
 @app.on_message(filters.command("id"))
 async def my_id(_, m):
-    await m.reply(f"Your ID: <code>{m.from_user.id}</code>\nChat ID: <code>{m.chat.id}</code>")
+    if m.from_user and (m.from_user.id in ADMINS or not ADMINS):  # regular users get no reply
+        await m.reply(f"Your ID: <code>{m.from_user.id}</code>\nChat ID: <code>{m.chat.id}</code>")
 
 
 ADMIN_CMDS = ["link", "addsource", "delsource", "sources", "movies", "delmovie"]
@@ -238,11 +238,7 @@ ADMIN_CMDS = ["link", "addsource", "delsource", "sources", "movies", "delmovie"]
 
 @app.on_message(filters.command(ADMIN_CMDS) & ~admin)
 async def not_admin(_, m):
-    await m.reply(
-        "⛔ You are not an admin of this bot.\n"
-        f"Your ID: <code>{m.from_user.id}</code>\n"
-        "Add it to the <code>ADMINS</code> environment variable and redeploy."
-    )
+    log.info("ignored admin command from non-admin %s", m.from_user.id if m.from_user else "?")  # silent
 
 
 @app.on_message(filters.command("link") & admin)
@@ -466,6 +462,14 @@ async def delmovie(c, m):
 _tasks: set = set()
 
 
+async def notify_admins(c: Client, text: str):
+    for a in ADMINS:
+        try:
+            await c.send_message(a, text)
+        except Exception:
+            pass
+
+
 def spawn(coro):
     t = asyncio.create_task(coro)
     _tasks.add(t)
@@ -503,10 +507,12 @@ async def on_join_request(c, req):
 async def go_live(c: Client, movie: dict):
     """First matching file delivered: approve every saved request, then publish the post."""
     chat_id = movie["channel_id"]
-    approved = 0
+    approved = failed = 0
     async for r in db.requests.find({"chat_id": chat_id}):
         if await approve_one(c, chat_id, r["user_id"]):
             approved += 1
+        else:
+            failed += 1
         await db.requests.delete_one({"_id": r["_id"]})
         await asyncio.sleep(0.1)
     bulk = getattr(c, "approve_all_chat_join_requests", None)  # catch requests we never saw
@@ -525,13 +531,12 @@ async def go_live(c: Client, movie: dict):
         except Exception as e:
             log.error("post to POST_CHANNEL failed: %s", e)
     log.info("%s is live: %d saved requests approved, posted=%s", movie["title"], approved, posted)
-    for a in ADMINS:
-        try:
-            await c.send_message(
-                a, f"🟢 <b>{esc(movie['title'])}</b> is live\n✅ Approved {approved} saved requests"
-                   f"\n{'📣 Posted to post channel' if posted else '⚠️ Not posted (POST_CHANNEL unset or failed)'}")
-        except Exception:
-            pass
+    await notify_admins(
+        c,
+        f"🟢 <b>{esc(movie['title'])}</b> is live\n✅ Approved {approved} saved requests"
+        + (f"\n⚠️ {failed} could not be approved (already joined/withdrawn)" if failed else "")
+        + f"\n{'📣 Posted to post channel' if posted else '⚠️ Not posted (POST_CHANNEL unset or failed)'}",
+    )
 
 
 # ───────────────────────── File routing ─────────────────────────
@@ -585,6 +590,8 @@ async def on_file(c, m):
             log.error("copy failed: %s", e)
             if m.chat.type == ChatType.PRIVATE:
                 await m.reply(f"❌ Failed: <code>{esc(e)}</code>", quote=True)
+            else:
+                await notify_admins(c, f"❌ Couldn't send a file to <b>{esc(movie['title'])}</b>: <code>{esc(e)}</code>")
             break
 
 
