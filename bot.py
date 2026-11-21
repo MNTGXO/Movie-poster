@@ -393,18 +393,20 @@ async def channel_input(c, m):
         "poster": IMG + r["poster"],
         "language": language,
         "quality": sess["quality"],
+        "live": bool(old and old["_id"] == r["id"] and old.get("live")),
     }
     if old and old["_id"] != r["id"]:
         await db.movies.delete_one({"_id": old["_id"]})  # channel re-linked to a different movie
     await db.movies.replace_one({"_id": r["id"]}, movie, upsert=True)
     await db.sessions.delete_one({"_id": uid})
 
-    targets = [m.chat.id] + ([POST_CHANNEL] if POST_CHANNEL else [])
-    for t in targets:
-        try:
-            await c.send_photo(t, movie["poster"], caption=post_caption(movie), reply_markup=post_markup(movie))
-        except Exception as e:
-            notes.append(f"⚠️ Couldn't post to {t}: {esc(e)}")
+    try:  # preview for the admin; the public post is sent when the first file arrives
+        await c.send_photo(m.chat.id, movie["poster"], caption=post_caption(movie), reply_markup=post_markup(movie))
+    except Exception as e:
+        notes.append(f"⚠️ Couldn't send preview: {esc(e)}")
+    if not movie["live"]:
+        notes.append("⏳ Join requests are saved now. When the first matching file is sent, they are all approved, "
+                     "new requests are auto-approved, and the post goes to the post channel.")
     await wait.edit_text(
         f"✅ Linked <b>{esc(movie['title'])}</b> → <code>{chat.id}</code>\n" + "\n".join(notes)
     )
@@ -444,7 +446,7 @@ async def sources(c, m):
 @app.on_message(filters.command("movies") & admin)
 async def movies_cmd(c, m):
     docs = await db.movies.find().to_list(None)
-    lines = [f"• <b>{esc(d['title'])}</b> ({d['year']}) → <code>{d['channel_id']}</code>  [id <code>{d['_id']}</code>]" for d in docs]
+    lines = [f"• {'🟢' if d.get('live') else '⏳'} <b>{esc(d['title'])}</b> ({d['year']}) → <code>{d['channel_id']}</code>  [id <code>{d['_id']}</code>]" for d in docs]
     await m.reply("\n".join(lines)[:4000] or "No movies linked yet.")
 
 
@@ -452,8 +454,84 @@ async def movies_cmd(c, m):
 async def delmovie(c, m):
     if len(m.command) < 2 or not m.command[1].isdigit():
         return await m.reply("Usage: <code>/delmovie tmdb_id</code>")
-    res = await db.movies.delete_one({"_id": int(m.command[1])})
-    await m.reply("🗑 Unlinked." if res.deleted_count else "Not found.")
+    doc = await db.movies.find_one({"_id": int(m.command[1])})
+    if not doc:
+        return await m.reply("Not found.")
+    await db.movies.delete_one({"_id": doc["_id"]})
+    await db.requests.delete_many({"chat_id": doc["channel_id"]})
+    await m.reply("🗑 Unlinked.")
+
+
+# ───────────────────────── Join requests ─────────────────────────
+_tasks: set = set()
+
+
+def spawn(coro):
+    t = asyncio.create_task(coro)
+    _tasks.add(t)
+    t.add_done_callback(_tasks.discard)
+
+
+async def approve_one(c: Client, chat_id: int, user_id: int) -> bool:
+    for _ in range(3):
+        try:
+            await c.approve_chat_join_request(chat_id, user_id)
+            return True
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 1)
+        except Exception as e:  # already a member, request withdrawn, etc.
+            log.info("approve %s in %s failed: %s", user_id, chat_id, e)
+            return False
+    return False
+
+
+@app.on_chat_join_request()
+async def on_join_request(c, req):
+    movie = await db.movies.find_one({"channel_id": req.chat.id})
+    if not movie:
+        return
+    if movie.get("live"):
+        await approve_one(c, req.chat.id, req.from_user.id)  # movie already has files → accept instantly
+        return
+    await db.requests.update_one(
+        {"chat_id": req.chat.id, "user_id": req.from_user.id},
+        {"$set": {"date": req.date}},
+        upsert=True,
+    )
+
+
+async def go_live(c: Client, movie: dict):
+    """First matching file delivered: approve every saved request, then publish the post."""
+    chat_id = movie["channel_id"]
+    approved = 0
+    async for r in db.requests.find({"chat_id": chat_id}):
+        if await approve_one(c, chat_id, r["user_id"]):
+            approved += 1
+        await db.requests.delete_one({"_id": r["_id"]})
+        await asyncio.sleep(0.1)
+    bulk = getattr(c, "approve_all_chat_join_requests", None)  # catch requests we never saw
+    if bulk:
+        try:
+            await bulk(chat_id)
+        except Exception as e:
+            log.info("bulk approve skipped: %s", e)
+
+    posted = False
+    if POST_CHANNEL:
+        try:
+            await c.send_photo(POST_CHANNEL, movie["poster"], caption=post_caption(movie),
+                               reply_markup=post_markup(movie))
+            posted = True
+        except Exception as e:
+            log.error("post to POST_CHANNEL failed: %s", e)
+    log.info("%s is live: %d saved requests approved, posted=%s", movie["title"], approved, posted)
+    for a in ADMINS:
+        try:
+            await c.send_message(
+                a, f"🟢 <b>{esc(movie['title'])}</b> is live\n✅ Approved {approved} saved requests"
+                   f"\n{'📣 Posted to post channel' if posted else '⚠️ Not posted (POST_CHANNEL unset or failed)'}")
+        except Exception:
+            pass
 
 
 # ───────────────────────── File routing ─────────────────────────
@@ -494,6 +572,9 @@ async def on_file(c, m):
             # caption=None keeps the original caption if analysis failed
             await m.copy(movie["channel_id"], caption=caption, reply_markup=BUTTON_MARKUP)
             await db.sent.insert_one({"channel": movie["channel_id"], "uid": media.file_unique_id})
+            flipped = await db.movies.update_one({"_id": movie["_id"], "live": {"$ne": True}}, {"$set": {"live": True}})
+            if flipped.modified_count:
+                spawn(go_live(c, movie))
             log.info("sent %s → %s", getattr(media, "file_name", ""), movie["title"])
             if m.chat.type == ChatType.PRIVATE:
                 await m.reply(f"✅ Sent to <b>{esc(movie['title'])}</b> channel.", quote=True)
@@ -515,6 +596,7 @@ async def health(_):
 async def main():
     await db.sent.create_index([("channel", 1), ("uid", 1)], unique=True)
     await db.movies.create_index("channel_id")
+    await db.requests.create_index([("chat_id", 1), ("user_id", 1)], unique=True)
 
     web_app = web.Application()
     web_app.router.add_get("/", health)
